@@ -44,9 +44,9 @@ async def async_main():
     )
     parser.add_argument(
         "--login-timeout",
-        help="login QR code timeout in seconds (default: 60)",
+        help="login QR code timeout in seconds (default: 180)",
         type=int,
-        default=60,
+        default=180,
     )
     parser.add_argument(
         "--mock-user-agent",

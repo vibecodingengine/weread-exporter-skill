@@ -170,7 +170,7 @@ class WeReadWebPage(object):
         force_login=False,
         mock_user_agent=False,
         proxy_server=None,
-        login_timeout=60,
+        login_timeout=180,
     ):
         logging.info("[%s] Launch url %s" % (self.__class__.__name__, self._home_url))
         if proxy_server:
@@ -705,7 +705,7 @@ class WeReadWebPage(object):
         try:
             await self._check_next_page()
         except utils.LoginRequiredError:
-            await self.login(timeout=60)
+            await self.login(timeout=180)
             return await self.goto_chapter(chapter_id, timeout=timeout)
 
     async def clear_cache(self):
