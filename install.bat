@@ -36,27 +36,34 @@ for /f "tokens=2" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i
 echo [成功] 找到 Python %PYTHON_VERSION%
 echo.
 
-REM 检查 pip
-echo [检查] 正在检查 pip...
-pip --version >nul 2>&1
+REM 创建隔离环境并安装依赖
+echo [安装] 正在创建 .venv...
+python -m venv .venv
 if errorlevel 1 (
-    echo [错误] 未找到 pip
-    echo         请确保 Python 安装时选择了 pip 组件
+    echo [错误] 创建虚拟环境失败
     pause
     exit /b 1
 )
-echo [成功] pip 已就绪
-echo.
-
-REM 安装依赖
-echo [安装] 正在安装 Python 依赖包...
-pip install -e .
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
 if errorlevel 1 (
     echo [错误] 依赖安装失败
     pause
     exit /b 1
 )
-echo [成功] 依赖安装完成
+.venv\Scripts\python.exe -m pip install --no-deps -e .
+if errorlevel 1 (
+    echo [错误] 项目安装失败
+    pause
+    exit /b 1
+)
+.venv\Scripts\python.exe -m playwright install chromium
+if errorlevel 1 (
+    echo [错误] Playwright Chromium 安装失败
+    pause
+    exit /b 1
+)
+echo [成功] 隔离环境安装完成
 echo.
 
 REM 检查 Claude Code CLI
@@ -93,7 +100,7 @@ echo   1. 在 Claude Code 中使用：
 echo      "Export the WeRead book with ID ^<book_id^> to epub"
 echo.
 echo   2. 或者直接命令行使用：
-echo      python -m weread_exporter -b ^<book_id^> -o epub
+echo      .venv\Scripts\python.exe -m weread_exporter -b ^<book_id^> -o epub
 echo.
 echo   更多信息请查看 INSTALL.md
 echo.

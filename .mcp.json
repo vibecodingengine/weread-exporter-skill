@@ -1,6 +1,6 @@
 {
   "weread-exporter": {
-    "command": "python3",
+    "command": ".venv/bin/python",
     "args": [".claude-plugin/mcp_server.py"]
   }
 }

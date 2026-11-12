@@ -1,0 +1,4 @@
+interface:
+  display_name: "WeRead Book Exporter"
+  short_description: "Securely export accessible WeRead books"
+  default_prompt: "Use $weread-book-exporter to export a WeRead book I can access as EPUB."

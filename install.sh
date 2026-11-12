@@ -36,28 +36,28 @@ check_python() {
     print_success "找到 Python $PYTHON_VERSION"
 }
 
-# 检查 pip 是否安装
-check_pip() {
-    print_info "检查 pip..."
-
-    if ! command -v pip3 &> /dev/null; then
-        print_error "未找到 pip3"
-        print_info "尝试安装 pip..."
-        python3 -m ensurepip --upgrade || {
-            print_error "pip 安装失败，请手动安装 pip"
-            exit 1
-        }
-    fi
-
-    print_success "pip 已就绪"
-}
-
 # 安装 Python 依赖
 install_dependencies() {
-    print_info "安装 Python 依赖包..."
+    print_info "创建隔离的 Python 环境并安装依赖..."
 
-    if ! pip3 install -e .; then
+    if ! python3 -m venv .venv; then
+        print_error "创建 .venv 失败，请安装 python3-venv"
+        exit 1
+    fi
+    if ! .venv/bin/python -m pip install --upgrade pip; then
+        print_error "pip 升级失败"
+        exit 1
+    fi
+    if ! .venv/bin/python -m pip install --require-hashes -r requirements.lock; then
         print_error "依赖安装失败"
+        exit 1
+    fi
+    if ! .venv/bin/python -m pip install --no-deps -e .; then
+        print_error "项目安装失败"
+        exit 1
+    fi
+    if ! .venv/bin/python -m playwright install chromium; then
+        print_error "Playwright Chromium 安装失败"
         exit 1
     fi
 
@@ -102,7 +102,7 @@ show_usage() {
     echo "     \"Export the WeRead book with ID <book_id> to epub\""
     echo ""
     echo "  2. 或者直接命令行使用："
-    echo "     python -m weread_exporter -b <book_id> -o epub"
+    echo "     .venv/bin/python -m weread_exporter -b <book_id> -o epub"
     echo ""
     echo "  更多信息请查看 .claude-plugin/README.md"
     echo ""
@@ -124,10 +124,12 @@ main() {
 
     # 执行安装步骤
     check_python
-    check_pip
     install_dependencies
-    check_claude
-    install_plugin
+    if command -v claude &> /dev/null; then
+        install_plugin
+    else
+        print_info "未安装 Claude Code，跳过 Claude 插件注册"
+    fi
     show_usage
 }
 

@@ -3,25 +3,7 @@ import asyncio
 import logging
 import os
 import sys
-
-
-def patch_windows():
-    bin_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "bin", "win32")
-    os.environ["PATH"] += ";" + bin_path
-    if hasattr(os, "add_dll_directory"):
-        os.add_dll_directory(bin_path)
-
-
-def patch_generateRequestHash():
-    from pyppeteer import network_manager
-
-    orig_generateRequestHash = network_manager.generateRequestHash
-
-    def patched_generateRequestHash(request):
-        request["headers"].pop("Origin", None)
-        return orig_generateRequestHash(request)
-
-    network_manager.generateRequestHash = patched_generateRequestHash
+from pathlib import Path
 
 
 async def async_main():
@@ -36,7 +18,7 @@ async def async_main():
         "--output-format",
         help="output file format",
         action="append",
-        choices=["md", "epub", "pdf", "mobi", "txt"],
+        choices=["md", "epub", "txt"],
     )
     parser.add_argument(
         "--load-timeout",
@@ -67,12 +49,6 @@ async def async_main():
         default=60,
     )
     parser.add_argument(
-        "--use-default-profile",
-        help="use default profile",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
         "--mock-user-agent",
         help="use mock user-agent",
         action="store_true",
@@ -80,12 +56,36 @@ async def async_main():
     )
     parser.add_argument(
         "--proxy-server",
-        help="http proxy server, e.g. http://127.0.0.1:8888",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=os.environ.get("WEREAD_EXPORTER_DATA_DIR", "~/.weread-exporter"),
+        help="private session/cache directory (default: ~/.weread-exporter)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="directory for exported files (default: ./output)",
     )
     args = parser.parse_args()
     args.output_format = args.output_format or ["epub"]
-    if "mobi" in args.output_format and "epub" not in args.output_format:
-        args.output_format.append("epub")
+    utils.validate_book_id(args.book_id)
+    if args.load_timeout < 10 or args.load_timeout > 600:
+        parser.error("--load-timeout must be between 10 and 600")
+    if args.load_interval < 0 or args.load_interval > 300:
+        parser.error("--load-interval must be between 0 and 300")
+    if args.login_timeout < 30 or args.login_timeout > 600:
+        parser.error("--login-timeout must be between 30 and 600")
+
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        data_dir.chmod(0o700)
+    except OSError:
+        pass
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
     extra_css = None
     if args.css_file:
@@ -104,8 +104,8 @@ async def async_main():
         logging.info("Exporting book %s" % book_id)
         page = webpage.WeReadWebPage(
             book_id,
-            cookie_path=os.path.join("cache", "cookie.txt"),
-            webcache_path="cache",
+            cookie_path=str(data_dir / "cookie.json"),
+            webcache_path=str(data_dir / "cache"),
         )
         if not await page.check_valid():
             logging.warning("Book %s status is invalid, stop exporting" % book_id)
@@ -116,42 +116,50 @@ async def async_main():
             print("\n" + "=" * 60)
             print("⚠️  Login Required")
             print("=" * 60)
-            print("No login session found. This is likely your first time using the tool.")
+            print(
+                "No login session found. This is likely your first time using the tool."
+            )
             print()
             print("To use this tool, you need to:")
             print("  1. Add the --force-login parameter to trigger login")
-            print("  2. Run: python -m weread_exporter -b %s -o epub --force-login" % book_id)
+            print(
+                "  2. Run: .venv/bin/python -m weread_exporter -b %s -o epub --headless --force-login"
+                % book_id
+            )
             print()
             print("Your first run will:")
-            print("  - Open a browser window")
-            print("  - Display a WeChat QR code")
+            print("  - Start an isolated browser")
+            print("  - Save a private QR screenshot and print its path")
             print("  - Wait for you to scan with WeChat mobile app")
             print("  - Save your login session for future use")
             print()
             print("After first login, you can omit --force-login parameter.")
             print("=" * 60 + "\n")
-            logging.error("No login session found. Please use --force-login parameter for first-time use.")
-            return -1
+            logging.error(
+                "No login session found. Please use --force-login parameter for first-time use."
+            )
+            return 2
         elif not args.force_login:
-            logging.info("Found existing login session (wr_vid=%s)" % page._cookie.get("wr_vid"))
+            logging.info("Found an existing login session")
 
-        save_path = os.path.join("cache", book_id)
-        output_dir = "output"
-        if not os.path.isdir(output_dir):
-            os.mkdir(output_dir)
-        exporter = export.WeReadExporter(page, save_path)
-        while True:
+        save_path = data_dir / "books" / book_id
+        exporter = export.WeReadExporter(page, str(save_path))
+        for attempt in range(1, 4):
             try:
                 await page.launch(
                     headless=args.headless,
                     force_login=args.force_login,
-                    use_default_profile=args.use_default_profile,
                     mock_user_agent=args.mock_user_agent,
                     proxy_server=args.proxy_server,
                     login_timeout=args.login_timeout,
                 )
             except RuntimeError:
-                logging.exception("Launch book %s home page failed" % book_id)
+                logging.exception(
+                    "Launch attempt %d/3 failed for book %s", attempt, book_id
+                )
+                await page.close()
+                if attempt == 3:
+                    raise
                 await asyncio.sleep(2)
                 continue
 
@@ -163,50 +171,27 @@ async def async_main():
             else:
                 await page.close()
                 break
+        else:
+            raise RuntimeError("Export failed after three attempts")
 
         await exporter.pre_process_markdown()
         title = await exporter.get_book_title()
         title = utils.format_filename(title)
+        if "md" in args.output_format:
+            save_path = str(output_dir / ("%s.md" % title))
+            if not os.path.isfile(save_path):
+                await exporter.merge_markdown(save_path)
+                logging.info("Save file %s complete" % save_path)
         if "epub" in args.output_format:
-            save_path = os.path.join(output_dir, "%s.epub" % title)
+            save_path = str(output_dir / ("%s.epub" % title))
             if os.path.isfile(save_path):
                 logging.info("File %s exist, ignore export" % save_path)
             else:
                 await exporter.markdown_to_epub(save_path, extra_css=extra_css)
                 logging.info("Save file %s complete" % save_path)
 
-        if "pdf" in args.output_format:
-            save_path = os.path.join(output_dir, "%s.pdf" % title)
-            if os.path.isfile(save_path):
-                logging.info("File %s exist, ignore export" % save_path)
-            else:
-                image_format = "jpg"
-                if sys.platform == "win32":
-                    image_format = "png"
-                await exporter.markdown_to_pdf(
-                    save_path,
-                    extra_css=extra_css,
-                    image_format=image_format,
-                )
-                logging.info("Save file %s complete" % save_path)
-
-        if "mobi" in args.output_format:
-            if sys.platform != "linux":
-                logging.error("Only linux system supported to export mobi format")
-                return -1
-            epub_path = os.path.join(output_dir, "%s.epub" % title)
-            save_path = os.path.join(output_dir, "%s.mobi" % title)
-            if os.path.isfile(save_path):
-                logging.info("File %s exist, ignore export" % save_path)
-            else:
-                await exporter.epub_to_mobi(epub_path, save_path)
-                if not os.path.isfile(save_path):
-                    logging.warning("Create mobi file failed")
-                    continue
-                logging.info("Save file %s complete" % save_path)
-
         if "txt" in args.output_format:
-            save_path = os.path.join(output_dir, "%s.txt" % title)
+            save_path = str(output_dir / ("%s.txt" % title))
             if os.path.isfile(save_path):
                 logging.info("File %s exist, ignore export" % save_path)
             else:
@@ -216,9 +201,6 @@ async def async_main():
 
 
 def main():
-    if sys.platform == "win32":
-        patch_windows()
-    patch_generateRequestHash()
     logging.root.level = logging.INFO
     handler = logging.StreamHandler()
     fmt = "[%(asctime)s][%(levelname)s]%(message)s"
@@ -228,13 +210,15 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(async_main())
-    except:
+        return loop.run_until_complete(async_main())
+    except Exception:
         import traceback
 
         traceback.print_exc()
-        return
+        return 1
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

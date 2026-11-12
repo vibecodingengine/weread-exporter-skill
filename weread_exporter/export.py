@@ -1,16 +1,13 @@
-import asyncio
+import hashlib
 import json
 import logging
 import os
-import sys
 import time
 
 import bs4
 import markdown
 
 from ebooklib import epub
-from weasyprint import HTML, CSS
-
 from . import utils
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +33,7 @@ class WeReadExporter(object):
         return meta_data["title"]
 
     def _make_chapter_path(self, index, chapter_id):
+        chapter_id = utils.validate_path_component(chapter_id, "chapter id")
         return os.path.join(self._chapter_dir, "%d-%s.md" % (index + 1, chapter_id))
 
     async def _load_meta_data(self):
@@ -154,40 +152,9 @@ class WeReadExporter(object):
     async def markdown_to_pdf(
         self, save_path, extra_css=None, image_format="jpg", dump_html=False
     ):
-        meta_data = await self._load_meta_data()
-        raw_html = '<img src="cover.jpg" style="width: 100%;">\n'
-        for index, chapter in enumerate(meta_data["chapters"]):
-            chapter_path = self._make_chapter_path(index, chapter["id"])
-            raw_html += self._markdown_to_html(chapter_path, wrap=False)
-        raw_html = raw_html.replace(
-            "<pre><code>", "<pre><code>\n"
-        )  # Fix unexpected indent
-        if image_format == "png":
-            soup = bs4.BeautifulSoup(raw_html, features="html.parser")
-            for img in soup.find_all("img"):
-                src = os.path.join(self._save_dir, img.attrs["src"])
-                if not src.endswith(".png"):
-                    png_path = src[:-3] + "png"
-                    utils.save_to_png(src, png_path)
-                    img.attrs["src"] = img.attrs["src"][:-3] + "png"
-
-            raw_html = soup.prettify()
-
-        if dump_html:
-            html_path = os.path.join(self._save_dir, "output.html")
-            with open(html_path, "w") as fp:
-                fp.write(raw_html)
-        html = HTML(string=raw_html, base_url=self._save_dir)
-        css = []
-        css_path = os.path.join(current_path, "style.css")
-        with open(css_path) as fp:
-            raw_css = fp.read()
-            if extra_css:
-                raw_css += "\n" + extra_css
-            css.append(CSS(string=raw_css))
-
-        # Generate PDF
-        html.write_pdf(save_path, stylesheets=css)
+        raise RuntimeError(
+            "PDF export is disabled in the hardened build. Export EPUB or TXT instead."
+        )
 
     async def markdown_to_epub(self, save_path, extra_css=None):
         meta_data = await self._load_meta_data()
@@ -284,23 +251,9 @@ class WeReadExporter(object):
         epub.write_epub(save_path, book, {})
 
     async def epub_to_mobi(self, epub_path, save_path):
-        kindlegen_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "bin", sys.platform, "kindlegen"
+        raise RuntimeError(
+            "MOBI export is disabled in the hardened build because it executes bundled binaries."
         )
-        if not os.path.isfile(kindlegen_path):
-            raise RuntimeError("File %s not exist" % kindlegen_path)
-        if sys.platform != "win32":
-            os.chmod(kindlegen_path, 0o755)
-        cmdline = [
-            kindlegen_path,
-            os.path.abspath(epub_path),
-            "-o",
-            os.path.basename(save_path),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmdline, cwd=os.path.dirname(save_path)
-        )
-        await proc.wait()
 
     async def save_cover_image(self):
         meta_data = await self._load_meta_data()
@@ -346,7 +299,7 @@ class WeReadExporter(object):
                             timeout=timeout,
                         ),
                         timeout=timeout + 60,
-                    )  # avoid pyppeteer hangs
+                    )  # avoid browser-automation hangs
                 except asyncio.TimeoutError:
                     logging.warning(
                         "[%s] Load chapter %s timeout %ds"
@@ -380,8 +333,7 @@ class WeReadExporter(object):
             markdown = await self._page.get_markdown()
 
             # Detect duplicate content to prevent infinite loops
-            import hashlib
-            current_hash = hashlib.md5(markdown.encode('utf-8')).hexdigest()
+            current_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
             if prev_chapter_hash == current_hash:
                 duplicate_count += 1
                 logging.warning(

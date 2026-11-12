@@ -6,12 +6,14 @@ import asyncio
 import json
 import logging
 import os
-import random
-import sys
+import secrets
+import stat
 import time
 import urllib.parse
+from pathlib import Path, PurePosixPath
 
-import pyppeteer
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 from . import utils
 
@@ -23,19 +25,21 @@ class WeReadWebPage(object):
     window_size = (1920, 1080)
 
     def __init__(self, book_id, cookie_path=None, webcache_path=None):
-        self._book_id = book_id
+        self._book_id = utils.validate_book_id(book_id)
         self._cookie_path = cookie_path
         self._cookie = {}
-        self._webcache_path = webcache_path or "cache"
-        if not os.path.isdir(self._webcache_path):
-            os.makedirs(self._webcache_path)
+        self._webcache_path = os.path.abspath(webcache_path or "cache")
+        os.makedirs(self._webcache_path, mode=0o700, exist_ok=True)
         self._home_url = "%s/web/bookDetail/%s" % (
             self.__class__.root_url,
             book_id,
         )
         self._chapter_root_url = self.__class__.root_url + "/web/reader/"
         self._browser = None
+        self._browser_context = None
         self._page = None
+        self._playwright = None
+        self._route_installed = False
         self._load_cookie()
         self._url = ""
 
@@ -71,7 +75,7 @@ class WeReadWebPage(object):
     async def get_user_info(self):
         vid = self._cookie.get("wr_vid")
         if not vid:
-            raise utils.InvalidUserError("Invalid cookie: %s" % self._format_cookie())
+            raise utils.InvalidUserError("Invalid or expired login cookie")
         url = "%s/web/user?userVid=%s" % (self.__class__.root_url, vid)
         headers = {"Referer": self.__class__.root_url, "Cookie": self._format_cookie()}
         rsp = await utils.fetch(url, headers=headers)
@@ -91,7 +95,7 @@ class WeReadWebPage(object):
                 key, value = cookie.split("=", 1)
                 self._cookie[key] = value
                 logging.info(
-                    "[%s] Update cookie %s" % (self.__class__.__name__, cookie)
+                    "[%s] Updated login cookie %s" % (self.__class__.__name__, key)
                 )
             self._save_cookie()
             headers["Cookie"] = self._format_cookie()
@@ -106,7 +110,7 @@ class WeReadWebPage(object):
 
     def _load_cookie(self):
         self._cookie = {}
-        if not os.path.isfile(self._cookie_path):
+        if not self._cookie_path or not os.path.isfile(self._cookie_path):
             return
         with open(self._cookie_path) as fp:
             cookie = fp.read()
@@ -117,7 +121,7 @@ class WeReadWebPage(object):
                     it = it.strip()
                     if "=" not in it:
                         continue
-                    key, value = it.split("=")
+                    key, value = it.split("=", 1)
                     self._cookie[key] = value
             else:
                 for key in cookie:
@@ -126,8 +130,15 @@ class WeReadWebPage(object):
     def _save_cookie(self):
         if not self._cookie_path:
             return
-        with open(self._cookie_path, "w") as fp:
-            fp.write(json.dumps(self._cookie))
+        cookie_path = Path(self._cookie_path).expanduser().resolve()
+        cookie_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp_path = cookie_path.with_suffix(cookie_path.suffix + ".tmp")
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(self._cookie, fp)
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp_path, cookie_path)
+        os.chmod(cookie_path, stat.S_IRUSR | stat.S_IWUSR)
 
     def _format_cookie(self, cookie=""):
         cookies = []
@@ -138,7 +149,7 @@ class WeReadWebPage(object):
         return "; ".join(cookies)
 
     async def _read_cookie(self):
-        cookies = await self._page.cookies()
+        cookies = await self._browser_context.cookies("https://weread.qq.com")
         cookie_map = {}
         for cookie in cookies:
             cookie_map[cookie["name"]] = cookie["value"]
@@ -153,66 +164,34 @@ class WeReadWebPage(object):
             return False
         return True
 
-    def _check_chrome(self):
-        path_list = os.environ["PATH"].split(";" if sys.platform == "win32" else ":")
-        for chrome in ("chrome", "google-chrome"):
-            if sys.platform == "win32":
-                chrome += ".exe"
-            for path in path_list:
-                if os.path.isfile(os.path.join(path, chrome)):
-                    return chrome
-
-        if sys.platform == "darwin":
-            chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            if os.path.isfile(chrome):
-                return chrome
-
-        if sys.platform == "win32":
-            command = "where chrome"
-        else:
-            command = "which chrome"
-        raise utils.ChromeNotInstalledError(
-            "Please make sure `chrome` is installed, and the install path is added to PATH environment. \nYou can test that with `%s` command."
-            % command
-        )
-
     async def launch(
         self,
         headless=False,
         force_login=False,
-        use_default_profile=False,
         mock_user_agent=False,
         proxy_server=None,
         login_timeout=60,
     ):
         logging.info("[%s] Launch url %s" % (self.__class__.__name__, self._home_url))
-        chrome = self._check_chrome()
-        args = ["--no-first-run", "--remote-allow-origins=*"]
-        if headless:
-            args.append("--headless")
-            if sys.platform == "linux" and os.getuid() == 0:
-                args.append("--no-sandbox")
-        if use_default_profile:
-            args.append("--user-data-dir")
-        else:
-            args.append("--window-size=%d,%d" % self.__class__.window_size)
-        if mock_user_agent:
-            args.append('--user-agent="%s"' % utils.generate_user_agent())
         if proxy_server:
-            args.append("--proxy-server=%s" % proxy_server)
-        args.append("about:blank")
-        logging.info(
-            "[%s] Chrome args: chrome %s" % (self.__class__.__name__, " ".join(args))
-        )
-        self._browser = await pyppeteer.launch(
-            executablePath=chrome,
-            ignoreDefaultArgs=True,
-            args=args,
-            defaultViewport=None,
-            logLevel=logging.INFO,
-        )
-        self._page = (await self._browser.pages())[0]
-        await self._page.evaluateOnNewDocument(
+            raise ValueError("Proxy servers are disabled in the hardened build")
+        self._playwright = await async_playwright().start()
+        try:
+            self._browser = await self._playwright.chromium.launch(headless=headless)
+        except Exception as exc:
+            await self._playwright.stop()
+            self._playwright = None
+            raise utils.ChromeNotInstalledError(
+                "Playwright Chromium is unavailable; run `python -m playwright install chromium`"
+            ) from exc
+        context_args = {
+            "viewport": {"width": self.window_size[0], "height": self.window_size[1]},
+        }
+        if mock_user_agent:
+            context_args["user_agent"] = utils.generate_user_agent()
+        self._browser_context = await self._browser.new_context(**context_args)
+        self._page = await self._browser_context.new_page()
+        await self._page.add_init_script(
             """() => {
             if (navigator.webdriver) {
                 Object.defineProperty(navigator, 'webdriver', {
@@ -258,13 +237,6 @@ class WeReadWebPage(object):
         """
         )
 
-        await self._page.setViewport(
-            {
-                "width": 0,
-                "height": 0,
-                "deviceScaleFactor": 0.3,
-            }
-        )
         if self._cookie.get("wr_vid"):
             try:
                 user_info = await self.get_user_info()
@@ -281,6 +253,7 @@ class WeReadWebPage(object):
         if self._cookie:
             await self._inject_cookie()
 
+        await self.pre_load_page()
         await self._page.goto(self._home_url)
         # await self.wait_for_selector("div.readerFooter a")
         if force_login:
@@ -292,18 +265,21 @@ class WeReadWebPage(object):
     async def close(self):
         if self._browser:
             await self._browser.close()
-            self._browser = self._page = None
+        if self._playwright:
+            await self._playwright.stop()
+        self._browser = self._browser_context = self._page = self._playwright = None
+        self._route_installed = False
 
     async def get_html(self):
         return await self._page.evaluate("document.documentElement.outerHTML;")
 
     async def screenshot(self, save_path):
-        await self._page.screenshot({"path": save_path})
+        await self._page.screenshot(path=save_path)
 
-    async def wait_for_selector(self, selector, timeout=30):
+    async def wait_for_selector(self, selector, timeout=30000):
         try:
-            return await self._page.waitForSelector(selector, timeout=timeout)
-        except pyppeteer.errors.TimeoutError as ex:
+            return await self._page.wait_for_selector(selector, timeout=timeout)
+        except PlaywrightTimeoutError as ex:
             html = await self.get_html()
             html_path = "webpage.html"
             with open(html_path, "wb") as fp:
@@ -322,8 +298,9 @@ class WeReadWebPage(object):
             raise ex
 
     def handle_log(self, message):
-        with open("%s.log" % self._book_id, "a+", encoding="utf-8") as fp:
-            fp.write("[%s] %s\n" % (self._url, message.text))
+        # Browser console text is remote-controlled and may contain secrets.
+        # Do not persist it or return it through MCP output.
+        logging.debug("[%s][Console] message suppressed", self.__class__.__name__)
 
     async def wait_for_avatar(self, timeout=30):
         time0 = time.time()
@@ -338,19 +315,21 @@ class WeReadWebPage(object):
             raise RuntimeError("Wait for avatar timeout")
 
     async def _inject_cookie(self):
-        for key in self._cookie:
-            logging.info(
-                "[%s] Inject cookie %s=%s"
-                % (self.__class__.__name__, key, self._cookie[key])
-            )
-            await self._page.setCookie(
+        cookies = []
+        for key, value in self._cookie.items():
+            logging.info("[%s] Restoring login cookie %s", self.__class__.__name__, key)
+            cookies.append(
                 {
                     "url": self.__class__.root_url,
                     "name": key,
-                    "value": self._cookie[key],
+                    "value": value,
                     "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
                 }
             )
+        if cookies:
+            await self._browser_context.add_cookies(cookies)
 
     async def login(self, timeout=60):
         selectors = [
@@ -371,6 +350,14 @@ class WeReadWebPage(object):
             script = "document.querySelector('div.menu_container img.wr_avatar_img')"
             time0 = time.time()
 
+            qr_path = Path(self._webcache_path).parent / "login-qr.png"
+            await asyncio.sleep(2)
+            await self._page.screenshot(path=str(qr_path), full_page=True)
+            try:
+                os.chmod(qr_path, 0o600)
+            except OSError:
+                pass
+
             # Better user prompt for login
             print("\n" + "=" * 60)
             print("📱 WeChat Login Required")
@@ -380,6 +367,7 @@ class WeReadWebPage(object):
             print("3. Scan the QR code to log in")
             print("4. Waiting for you to scan...")
             print(f"⏱️  Timeout: {timeout} seconds")
+            print(f"LOGIN_QR={qr_path}", flush=True)
             print("=" * 60 + "\n")
 
             while time.time() - time0 < timeout:
@@ -390,6 +378,7 @@ class WeReadWebPage(object):
                         "[%s] Waiting for login... (%d seconds remaining)"
                         % (self.__class__.__name__, remaining)
                     )
+                    await self._page.screenshot(path=str(qr_path), full_page=True)
                 await asyncio.sleep(1)
                 result = await self._page.evaluate(script)
                 if not result:
@@ -413,36 +402,55 @@ class WeReadWebPage(object):
         return False
 
     async def _get_from_cache_or_server(self, url, headers=None):
-        u = urllib.parse.urlparse(url)
-        path = os.path.join(
-            self._webcache_path, "resources", u.path[1:].replace("/", os.sep)
-        )
-        if os.path.isfile(path):
-            with open(path, "rb") as fp:
+        parsed = utils.validate_weread_url(url)
+        decoded_path = urllib.parse.unquote(parsed.path)
+        parts = PurePosixPath(decoded_path).parts
+        if ".." in parts or any("\x00" in part for part in parts):
+            raise ValueError("Unsafe resource path")
+        relative_parts = [part for part in parts if part not in ("/", "")]
+        if not relative_parts:
+            relative_parts = ["index"]
+        base_path = Path(self._webcache_path, "resources", parsed.hostname).resolve()
+        path = base_path.joinpath(*relative_parts).resolve()
+        if os.path.commonpath((str(base_path), str(path))) != str(base_path):
+            raise ValueError("Resource cache path escaped its root")
+        if path.is_file():
+            with path.open("rb") as fp:
                 return 200, {}, fp.read()
 
-        dirpath = os.path.dirname(path)
-        if not os.path.isdir(dirpath):
-            os.makedirs(dirpath)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         status, headers, body = await utils.fetch(
             url, headers=headers, respond_with_headers=True
         )
         if status == 200:
-            with open(path, "wb") as fp:
+            with path.open("wb") as fp:
                 fp.write(body)
         return status, headers, body
 
     def _handle_request_headers(self, url, headers):
+        parsed = utils.validate_weread_url(url)
+        headers = dict(headers)
         for key in ("baggage", "sentry-trace"):
             headers.pop(key, None)
-        cookie = ""
-        if "/web/reader/" in url:
-            cookie = "wr_useHorizonReader=0"
-        headers["cookie"] = self._format_cookie(cookie)
+        if parsed.hostname == "weread.qq.com":
+            cookie = "wr_useHorizonReader=0" if "/web/reader/" in parsed.path else ""
+            headers["cookie"] = self._format_cookie(cookie)
+        else:
+            headers.pop("cookie", None)
+            headers.pop("Cookie", None)
         return headers
 
     def _handle_response_headers(self, url, headers):
-        if "oss.weread.qq.com" in url:
+        parsed = utils.validate_weread_url(url)
+        headers = {str(key): str(value) for key, value in dict(headers).items()}
+        for key in list(headers):
+            if key.lower() in (
+                "content-encoding",
+                "content-length",
+                "transfer-encoding",
+            ):
+                headers.pop(key, None)
+        if parsed.hostname == "oss.weread.qq.com":
             headers["Access-Control-Allow-Origin"] = "*"
             headers["Access-Control-Request-Method"] = "*"
             headers["Access-Control-Allow-Headers"] = "*"
@@ -456,24 +464,28 @@ class WeReadWebPage(object):
             return body.replace(b"</head>", inject_script.encode() + b"</head>")
         return body
 
-    async def _handle_request(self, request):
-        if request.url.startswith("chrome-extension://"):
-            return await request.continue_()
+    async def _handle_request(self, route):
+        request = route.request
+        if request.url.startswith(("data:", "blob:", "about:")):
+            return await route.continue_()
+        try:
+            urlobj = utils.validate_weread_url(request.url)
+        except ValueError:
+            logging.warning("Blocked browser request to a non-WeRead destination")
+            return await route.abort("blockedbyclient")
 
-        if "/web/1.392ec47a.js" in request.url:
+        if urlobj.path == "/web/1.392ec47a.js":
             with open(
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.js"),
                 "rb",
             ) as fp:
                 hook_script = fp.read()
-                response = {
-                    "status": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": hook_script,
-                }
-                return await request.respond(response)
+                return await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "application/javascript"},
+                    body=hook_script,
+                )
 
-        urlobj = urllib.parse.urlparse(request.url)
         is_resource_file = urlobj.path.endswith(
             (".js", ".css", ".jpg", ".png", ".gif", ".svg")
         )
@@ -491,7 +503,7 @@ class WeReadWebPage(object):
         elif request.method == "GET" and is_resource_file:
             status, headers, body = await self._get_from_cache_or_server(request.url)
         elif "/web/book/read" in request.url:
-            body = b'{"succ":1,"synckey":%d}' % random.randint(10000000, 100000000)
+            body = b'{"succ":1,"synckey":%d}' % (10000000 + secrets.randbelow(90000001))
             headers["Content-Type"] = "application/json; charset=utf-8"
             headers["Content-Length"] = str(len(body))
             logging.info(
@@ -518,11 +530,11 @@ class WeReadWebPage(object):
                 % (self.__class__.__name__, request.method, request.url)
             )
         elif "hijack_csp_report" in request.url:
-            return
+            return await route.abort("blockedbyclient")
         elif "/river/single" in request.url:
             body = b'{"err_code":0,"msg":"suc"}'
             headers["Content-Type"] = "application/json; charset=utf-8"
-            headers["Content-Length"] = len(body)
+            headers["Content-Length"] = str(len(body))
             logging.info(
                 "[%s][%s] Url %s return mock data"
                 % (self.__class__.__name__, request.method, request.url)
@@ -538,7 +550,7 @@ class WeReadWebPage(object):
                 request.url,
                 method=request.method,
                 headers=headers,
-                data=request.postData,
+                data=request.post_data,
                 respond_with_headers=True,
             )
             headers = dict(headers)
@@ -553,32 +565,41 @@ class WeReadWebPage(object):
                     len(body),
                 )
             )
-            if "Content-Security-Policy" in headers:
+            csp_key = next(
+                (key for key in headers if key.lower() == "content-security-policy"),
+                None,
+            )
+            if csp_key:
                 logging.info(
-                    "[%s][%s] Url %s has Content-Security-Policy: %s"
+                    "[%s][%s] Removing CSP from an allowed WeRead response for hook injection"
                     % (
                         self.__class__.__name__,
                         request.method,
-                        request.url,
-                        headers["Content-Security-Policy"],
                     )
                 )
-                headers.pop("Content-Security-Policy")
+                headers.pop(csp_key)
 
         headers = self._handle_response_headers(request.url, headers)
-        response = {
-            "status": status,
-            "headers": headers,
-            "body": self._handle_http_body(request.url, body),
-        }
-        return await request.respond(response)
+        return await route.fulfill(
+            status=status,
+            headers={str(key): str(value) for key, value in headers.items()},
+            body=self._handle_http_body(request.url, body),
+        )
 
-    def handle_request(self, request):
-        asyncio.ensure_future(self._handle_request(request))
+    async def _route_request(self, route):
+        try:
+            await self._handle_request(route)
+        except Exception:
+            logging.exception("Failed to safely proxy an allowed WeRead request")
+            try:
+                await route.abort("failed")
+            except Exception:
+                logging.debug("Route was already handled while aborting")
 
     async def pre_load_page(self):
-        await self._page.setRequestInterception(True)
-        self._page.on("request", self.handle_request)
+        if not self._route_installed:
+            await self._page.route("**/*", self._route_request)
+            self._route_installed = True
 
     async def get_markdown(self):
         script = "canvasContextHandler.data.complete;"
@@ -616,7 +637,9 @@ class WeReadWebPage(object):
                     "[%s] Detected login prompt in content: %s"
                     % (self.__class__.__name__, prompt)
                 )
-                raise utils.LoginRequiredError(f"Content contains login prompt: {prompt}")
+                raise utils.LoginRequiredError(
+                    f"Content contains login prompt: {prompt}"
+                )
 
         return result
 
@@ -630,7 +653,7 @@ class WeReadWebPage(object):
                 await self.wait_for_selector(
                     "button.readerFooter_button", timeout=60000
                 )
-            except pyppeteer.errors.TimeoutError:
+            except PlaywrightTimeoutError:
                 logging.info("[%s] load selector timeout " % self.__class__.__name__)
                 break
             result = await self._page.evaluate(
@@ -643,7 +666,9 @@ class WeReadWebPage(object):
 
             # Check for purchase/subscription prompts
             if any(keyword in result for keyword in ["购买", "订阅", "付费", "会员"]):
-                raise utils.LoginRequiredError(f"Chapter requires purchase/subscription: {result}")
+                raise utils.LoginRequiredError(
+                    f"Chapter requires purchase/subscription: {result}"
+                )
 
             if result == "下一页":
                 consecutive_next_page += 1

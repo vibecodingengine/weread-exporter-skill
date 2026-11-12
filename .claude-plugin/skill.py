@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-WeRead Exporter Skill - Export WeRead books to various formats
+WeRead Exporter Skill - Export accessible WeRead books
 
 Usage as a skill:
-  Input JSON: {"book_id": "xxx", "formats": ["epub", "pdf"], "headless": false, ...}
+  Input JSON: {"book_id": "xxx", "formats": ["epub", "txt"], "headless": false, ...}
 """
 
 import argparse
@@ -13,19 +13,20 @@ import os
 import sys
 
 # Add project root to path
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_DIR)
+
+from weread_exporter import utils
+
+
+ALLOWED_FORMATS = frozenset({"epub", "txt", "md"})
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="weread-exporter-skill",
-        description="WeRead book exporter skill"
+        prog="weread-exporter-skill", description="WeRead book exporter skill"
     )
-    parser.add_argument(
-        "--skill-input",
-        help="JSON input for skill execution"
-    )
+    parser.add_argument("--skill-input", help="JSON input for skill execution")
 
     args = parser.parse_args()
 
@@ -43,28 +44,40 @@ def main():
         print("WeRead Exporter Skill")
         print("=" * 60)
         print()
-        print("This skill exports WeRead books to various formats.")
+        print("This skill exports accessible WeRead books to EPUB, TXT, or Markdown.")
         print()
         print("Usage:")
         print("  /export-weread-book <book_id> [options]")
         print()
         print("Parameters:")
         print("  book_id       (required)  The WeRead book ID")
-        print("                           Get it from: https://weread.qq.com/web/bookDetail/{id}")
+        print(
+            "                           Get it from: https://weread.qq.com/web/bookDetail/{id}"
+        )
         print()
         print("Options:")
-        print("  formats       (optional)  Output format(s): epub, pdf, mobi, txt, md")
+        print("  formats       (optional)  Output format(s): epub, txt, md")
         print("                           Default: epub")
-        print("  headless      (optional)  Run chrome in headless mode (default: false)")
+        print(
+            "  headless      (optional)  Run chrome in headless mode (default: false)"
+        )
         print("  force_login   (optional)  Force login first (default: false)")
-        print("  login_timeout (optional)  Login QR code timeout in seconds (default: 60)")
-        print("  load_timeout  (optional)  Load chapter timeout in seconds (default: 60)")
-        print("  load_interval (optional)  Load chapter interval in seconds (default: 30)")
+        print(
+            "  login_timeout (optional)  Login QR code timeout in seconds (default: 180)"
+        )
+        print(
+            "  load_timeout  (optional)  Load chapter timeout in seconds (default: 60)"
+        )
+        print(
+            "  load_interval (optional)  Load chapter interval in seconds (default: 30)"
+        )
         print()
         print("Examples:")
-        print('  /export-weread-book 08232ac0720befa90825d88')
-        print('  /export-weread-book 08232ac0720befa90825d88 --formats epub pdf')
-        print('  /export-weread-book 08232ac0720befa90825d88 --formats epub --headless true')
+        print("  /export-weread-book 08232ac0720befa90825d88")
+        print("  /export-weread-book 08232ac0720befa90825d88 --formats epub txt")
+        print(
+            "  /export-weread-book 08232ac0720befa90825d88 --formats epub --headless true"
+        )
         print()
         print("Output:")
         print("  Exported files are saved to: ./output/")
@@ -76,18 +89,23 @@ def skill_main(input_data):
     """Main skill execution function"""
     # Validate required parameters
     book_id = input_data.get("book_id")
-    if not book_id:
-        print("Error: book_id is required", file=sys.stderr)
+    try:
+        utils.validate_book_id(book_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Get formats with default - always include epub if pdf is requested
-    formats = input_data.get("formats", ["epub", "pdf"])
-    if isinstance(formats, str):
-        formats = [formats]
-
-    # Auto-add epub if pdf is requested and epub is not included
-    if "pdf" in formats and "epub" not in formats:
-        formats.append("epub")
+    # Validate formats against the intentionally small supported set.
+    formats = input_data.get("formats", ["epub"])
+    if (
+        not isinstance(formats, list)
+        or not formats
+        or any(
+            not isinstance(fmt, str) or fmt not in ALLOWED_FORMATS for fmt in formats
+        )
+    ):
+        print("Error: formats may contain only epub, txt, or md", file=sys.stderr)
+        sys.exit(1)
 
     # Build command arguments
     cmd_args = ["-m", "weread_exporter", "-b", book_id]
@@ -95,7 +113,7 @@ def skill_main(input_data):
         cmd_args.extend(["-o", fmt])
 
     # Default to force_login for better compatibility
-    force_login = input_data.get("force_login", True)
+    force_login = input_data.get("force_login", False)
     if force_login:
         cmd_args.append("--force-login")
 
@@ -103,25 +121,41 @@ def skill_main(input_data):
     if input_data.get("headless"):
         cmd_args.append("--headless")
 
-    if input_data.get("load_timeout"):
-        cmd_args.extend(["--load-timeout", str(input_data["load_timeout"])])
-
-    if input_data.get("load_interval"):
-        cmd_args.extend(["--load-interval", str(input_data["load_interval"])])
-
-    if input_data.get("login_timeout"):
-        cmd_args.extend(["--login-timeout", str(input_data["login_timeout"])])
+    load_timeout = input_data.get("load_timeout", 60)
+    load_interval = input_data.get("load_interval", 30)
+    login_timeout = input_data.get("login_timeout", 180)
+    if (
+        isinstance(load_timeout, bool)
+        or not isinstance(load_timeout, int)
+        or not 10 <= load_timeout <= 600
+    ):
+        raise ValueError("load_timeout must be between 10 and 600")
+    if (
+        isinstance(load_interval, bool)
+        or not isinstance(load_interval, int)
+        or not 0 <= load_interval <= 300
+    ):
+        raise ValueError("load_interval must be between 0 and 300")
+    if (
+        isinstance(login_timeout, bool)
+        or not isinstance(login_timeout, int)
+        or not 30 <= login_timeout <= 600
+    ):
+        raise ValueError("login_timeout must be between 30 and 600")
+    cmd_args.extend(["--load-timeout", str(load_timeout)])
+    cmd_args.extend(["--load-interval", str(load_interval)])
+    cmd_args.extend(["--login-timeout", str(login_timeout)])
 
     # Execute the exporter
     print(f"Exporting WeRead book: {book_id}")
     print(f"Formats: {', '.join(formats)}")
     print()
 
-    import subprocess
-    result = subprocess.run(
-        [sys.executable] + cmd_args,
-        cwd=PROJECT_DIR,
-        check=True
+    # The interpreter is fixed and every argument is allowlisted or range-checked.
+    import subprocess  # nosec B404
+
+    result = subprocess.run(  # nosec B603
+        [sys.executable] + cmd_args, cwd=PROJECT_DIR, check=True
     )
 
     # Show output location

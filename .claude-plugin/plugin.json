@@ -1,7 +1,7 @@
 {
   "name": "weread-exporter",
-  "version": "1.0.0",
-  "description": "WeRead book exporter - Export WeRead books to epub, pdf, mobi, txt, or markdown format. Use the skill: /export-weread-book <book_id>",
+  "version": "0.2.0",
+  "description": "Securely export accessible WeRead books to EPUB, TXT, or Markdown. Use: /export-weread-book <book_id>",
   "author": {
     "name": "xujinmeng"
   }
